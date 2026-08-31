@@ -1,0 +1,31 @@
+# Data directory: excluded by default (large generated/raw data)
+data/*
+!data/preprocessed/
+data/preprocessed/*
+!data/preprocessed/beauty/
+!data/preprocessed/books/
+!data/preprocessed/video_games/
+
+# Only allow LLM-generated cards per domain
+data/preprocessed/beauty/*
+!data/preprocessed/beauty/cards.jsonl
+
+data/preprocessed/video_games/*
+!data/preprocessed/video_games/cards.jsonl
+
+# books also includes queries.parquet (tracked via Git LFS)
+data/preprocessed/books/*
+!data/preprocessed/books/cards.jsonl
+!data/preprocessed/books/queries.parquet
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/

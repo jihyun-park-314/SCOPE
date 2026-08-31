@@ -1,0 +1,13 @@
+You are building a video game knowledge card for a recommender system.
+Given the metadata and player reviews below, write a compact semantic card with EXACTLY these fields:
+Genre: <game genre, gameplay type, setting, or core mechanics, grounded in reviews and metadata>
+Audience: <who is likely to enjoy or benefit from it; age range, skill level, or player preference if evident>
+Style: <gameplay style, difficulty, pacing, controls, visual presentation, and overall play experience; use consistent signals across reviews and note disagreements>
+Context: <typical play contexts, e.g., solo play, multiplayer, family play, short sessions, long sessions, competitive play, casual relaxation, or gift>
+Rules: ground every claim in the reviews and metadata; ignore promotional or marketing language; do not reveal spoilers beyond the basic premise; distinguish platform-specific issues when evident; <=120 words total.
+
+[METADATA]
+{meta}
+
+[REVIEWS]
+{reviews}

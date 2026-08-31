@@ -1,0 +1,4 @@
+Given a review from Amazon, can you rephrase it with a first-person tone as if you are the customer looking for a beauty product? Give me the rephrased output without saying anything else. Note that the name of the beauty product must not show in the output since you are looking for it. You should focus on the stable intent behind the review, such as what kind of beauty product the customer wants and why. You should ignore irrelevant information that doesn't help with the rewriting. If the review does not contain any useful intent, output: general beauty product recommendation.
+
+[REVIEW]
+{review}

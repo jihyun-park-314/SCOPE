@@ -1,0 +1,1 @@
+Represent this book for retrieval based on genre, topic, mood, audience, style, difficulty, use case, and reader intent.

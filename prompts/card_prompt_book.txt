@@ -1,0 +1,13 @@
+You are building a book knowledge card for a recommender system.
+Given the metadata and reader reviews below, write a compact semantic card with EXACTLY these fields:
+Genre: <genre/topic, grounded in reviews and metadata>
+Audience: <who reads/benefits from it; age or expertise level if evident>
+Style: <author and writing style, difficulty, pacing; consistent signals across reviews, note disagreements>
+Context: <typical reading contexts, e.g., gift, coursework, vacation read, book club>
+Rules: ground every claim in the reviews and metadata; ignore marketing blurbs; no spoilers beyond premise; <=120 words total.
+
+[METADATA]
+{meta}
+
+[REVIEWS]
+{reviews}

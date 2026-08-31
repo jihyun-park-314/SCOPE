@@ -1,0 +1,4 @@
+Given a review from Amazon, can you rephrase it with a first-person tone as if you are the customer looking for a video game? Give me the rephrased output without saying anything else. Note that the name of the video game, author, or series must not show in the output since you are looking for it. You should focus on the stable intent behind the review, such as what kind of video game the customer wants and why. You should ignore irrelevant information that doesn't help with the rewriting. If the review does not contain any useful intent, output: general video game recommendation.
+
+[REVIEW]
+{review}
