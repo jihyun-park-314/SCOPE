@@ -47,7 +47,6 @@ The LLM-generated Books artifacts — surrogate queries and item semantic cards 
 SCOPE/
 ├── run.sh                       Pipeline driver: stage selection, prerequisite checks, overwrite guards
 ├── requirements.txt
-├── LICENSE
 ├── src/
 │   ├── config.py                Single source of truth: dataset registry and path derivation
 │   ├── download_data.py         [1] Download raw Amazon Reviews 2023 parquet files
@@ -393,9 +392,9 @@ pinning `OMP`, `MKL`, and `OpenBLAS` thread counts to one.
 
 ---
 
-## 13. License
+## 13. Terms of use
 
-The source code in this repository is released under the [MIT License](LICENSE).
+The license for this code will be stated upon publication.
 
 The artifacts distributed with the release are derived from Amazon Reviews 2023 and remain subject to
 the terms of that dataset. The raw review corpus itself is not redistributed here.
