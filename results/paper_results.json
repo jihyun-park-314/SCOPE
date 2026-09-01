@@ -1,0 +1,38 @@
+{
+  "model": "SCOPE",
+  "seeds": [
+    2026,
+    2027,
+    2028,
+    2029
+  ],
+  "model_selection": "epoch with the highest validation NDCG@10; test is evaluated once, on that checkpoint",
+  "std": "sample standard deviation over the seeds (ddof=1)",
+  "Books": {
+    "n_seeds": 4,
+    "seeds": [
+      2026,
+      2027,
+      2028,
+      2029
+    ],
+    "best_epochs": [
+      111,
+      83,
+      91,
+      92
+    ],
+    "HR@10": {
+      "mean": 0.14415,
+      "std": 0.00546
+    },
+    "NDCG@10": {
+      "mean": 0.088725,
+      "std": 0.003387
+    },
+    "MRR": {
+      "mean": 0.0799,
+      "std": 0.00291
+    }
+  }
+}

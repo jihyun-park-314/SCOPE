@@ -1,49 +1,4 @@
 # -*- coding: utf-8 -*-
-"""
-T0/T1 재현 수정판(v2) -- 원본 model.py (구 train_eval_halo_sr_semantic_anchor.py) main()과 RNG 소비
-순서를 정확히 일치시키기 위한 재작성.
-
-v1(train_attention_residual.py)에서 발견된 RNG-궤적 이탈 3가지와 그 수정:
-
-1. 원본은 학습 시작 전 `evaluate(model, valid_data, ..., mode="query_only")` 를 실행한다
-   (epoch-0 sanity eval). 이 호출은 valid_data 전체(20,143개)에 대해 __getitem__ ->
-   sample_negative() 를 호출해 전역 `random` 모듈 상태를 소비한다. v1은 이 단계를
-   생략해 이후 모든 negative sampling이 원본과 다른 지점에서 시작됐다.
-   -> v2는 원본과 동일한 함수(`model.evaluate`)를 동일한
-      인자로, 동일한 위치(모델 생성 직후, train_loader 생성 전)에서 호출한다.
-
-2. v1은 학습 시작 전 `ref_batch = collate_fn([train_data[i] for i in range(256)])` 를
-   만들어 추가로 256개의 sample_negative 호출을 전역 random에서 소비했다.
-   -> v2는 gradient-instrumentation용 reference batch를 학습 시작 전에 만들지 않는다
-      (offline_diagnostics_v2.py에서 학습 종료 후에만 구성).
-
-3. v1은 첫 배치 assert를 위해 `next(iter(train_loader))` 를 호출했다 -- DataLoader의
-   RandomSampler는 매 `iter()` 호출마다 전역 torch RNG에서 1회 draw로 새 시드를 뽑아
-   로컬 permutation을 생성하므로, 이 호출 자체가 실제 학습 루프가 만들 permutation과는
-   다른 permutation을 소비/폐기하고 전역 torch RNG 위치도 앞으로 밀어버린다.
-   -> v2는 act_raw assert를 실제 학습 루프의 epoch=1, batch_idx=0 배치 안에서, 그것도
-      이미 계산된 단일 forward의 텐서(u_star/e_all/diag)만으로 수행한다(별도 forward,
-      별도 iter() 호출 없음) -- history_ablation="u_act_only"에서는 정의상
-      u_star == normalize(u_act) 이므로 act_raw_score(u_act,...)와
-      sum(u_star*e_all[item])이 수학적으로 완전히 동일해야 한다.
-
-학습 루프 자체는 원본과 동일하게 매 epoch (1) train_one_epoch, (2) evaluate(mode="full")
-단 1회만 수행한다. attention-only 평가/ruin-rescue/gradient instrumentation은 전부
-offline_diagnostics_v2.py로 옮겨 학습 궤적에 영향을 주지 않는다.
-(※ offline_diagnostics_v2.py는 구 HALO 저장소의 학습 후 분석 스크립트로, SCOPE에는 포함돼
- 있지 않다. 아래에서 이 이름이 나오는 곳은 전부 "여기서 하지 않는다"는 뜻이다.)
-
----
-T1 확장 (gamma>0, checkpoint 보존 정책 추가): T0와 T1이 동일 batch 순서/동일 sampled
-negative를 쓰도록(유일한 차이는 gamma*L_act) attention-only checkpoint 후보 선정용
-평가도 `dataset.__getitem__`/`sample_negative()`를 전혀 거치지 않는 RNG-free 평가
-경로(`evaluate_attention_only_no_rng`)로 구현한다 -- 이 경로는 애초에 "neg"를 쓰지
-않는 full-catalog 랭킹이므로 negative sampling 자체가 불필요하며, 이를 우회함으로써
-매 epoch 추가되는 이 평가가 전역 random 모듈 상태를 전혀 소비하지 않게 한다(joint
-top-3 선정에 쓰이는 official_evaluate 호출 -- 이것도 원래 "neg"를 쓰지 않지만 원본
-A5와의 RNG parity를 위해 원본과 동일하게 그대로 유지 -- 뒤에 이어지는 것과 무관하게
-독립적으로 안전).
-"""
 import argparse
 import hashlib
 import random
@@ -70,10 +25,7 @@ A5_ARGS = dict(
     lr=1e-3, weight_decay=1e-5, seed=2026,
 )
 
-
 def build_model(item_embs, device, history_ablation=None):
-    """history_ablation=None이면 A5_ARGS 기본값("u_act_only")을 쓴다 (T0/T1 하위호환).
-    M2는 "h_n_only", M3는 "none"(learned gate)을 명시적으로 넘긴다."""
     ha = history_ablation if history_ablation is not None else A5_ARGS["history_ablation"]
     return HaloSRSemanticAnchor(
         item_embs=item_embs, emb_dim=item_embs.shape[1], num_items=item_embs.shape[0] - 1,
@@ -85,14 +37,11 @@ def build_model(item_embs, device, history_ablation=None):
         objective=A5_ARGS["objective"], no_backbone_fusion=True, backbone_fusion=A5_ARGS["backbone_fusion"],
     ).to(device)
 
-
 def act_raw_score(u_act, e_all, item_ids):
     act_n = F.normalize(u_act, dim=-1)
     return torch.sum(act_n * e_all[item_ids], dim=-1)
 
-
 def joint_and_act_losses(model, history, delta_t, query_emb, pos, neg):
-    """단일 forward에서 L_joint, L_act, 그리고 assert/instrumentation에 쓸 텐서를 반환."""
     u_star, q, e_all, diag = model.forward_user_vector(history, delta_t, query_emb, return_diag=True)
     pos_logits = model.score_against(u_star, q, pos, e_all)
     neg_logits = model.score_against(u_star, q, neg, e_all)
@@ -105,15 +54,7 @@ def joint_and_act_losses(model, history, delta_t, query_emb, pos, neg):
 
     return L_joint, L_act, dict(u_star=u_star, q=q, e_all=e_all, diag=diag)
 
-
 def inline_assert_act_raw_matches_u_star(u_star, e_all, diag, pos, neg):
-    """추가 forward 없이, 이미 계산된 u_star/e_all/diag['u_act']만으로 act_raw 공식을 검증한다.
-    history_ablation="u_act_only" + normalize_u_star(기본 True)에서만 정의상
-    u_star == F.normalize(u_act)이므로, act_raw_score(u_act, e_all, item)와
-    sum(u_star * e_all[item], dim=-1)이 수학적으로 완전히 동일해야 한다(부동소수 오차 수준
-    미만 -- eval-mode 전환도, model.full_scores() 재호출도 필요 없다). h_n_only/none(gated)
-    에서는 이 항등식이 성립하지 않으므로 호출자가 history_ablation=="u_act_only"일 때만
-    호출해야 한다."""
     u_act = diag["u_act"]
     my_pos = act_raw_score(u_act, e_all, pos)
     my_neg = act_raw_score(u_act, e_all, neg)
@@ -124,14 +65,10 @@ def inline_assert_act_raw_matches_u_star(u_star, e_all, diag, pos, neg):
     if max_diff >= 1e-5:
         raise RuntimeError(
             f"[ASSERT FAIL] act_raw != sum(u_star*e_all) (max_abs_diff={max_diff:.3e} >= 1e-5) "
-            f"-- history_ablation/normalize_u_star 설정이 예상과 다름. 학습 중단."
+            f"-- history_ablation / normalize_u_star differ from what was expected. Stopping."
         )
 
-
 def _build_batch_no_neg(dataset, indices, max_len):
-    """dataset.__getitem__/sample_negative()를 전혀 거치지 않고(negative 없음) history/
-    delta_t/query_emb/target만 직접 구성한다 -- attention-only/joint full-catalog 랭킹은
-    애초에 "neg"를 쓰지 않으므로, 이 경로는 전역 random 모듈 상태를 0회 소비한다."""
     hist_list, delta_list, target_list = [], [], []
     for idx in indices:
         obj = dataset.rows[idx]
@@ -152,34 +89,16 @@ def _build_batch_no_neg(dataset, indices, max_len):
         "target": torch.LongTensor(target_list),
     }
 
-
 def _mask_seen_(scores, history, target):
-    """scores[i, history[i,j]] = -1e9 (target 자신은 제외) -- Python 이중 루프 없이 scatter_로
-    처리 (offline_diagnostics_v2.mask_seen_와 동일 로직; 순환 import를 피하려 여기 복제)."""
     scores[:, 0] = -1e9
     is_target = history.eq(target.view(-1, 1))
     seen_idx = torch.where(is_target, torch.zeros_like(history), history)
     scores.scatter_(1, seen_idx, torch.full_like(seen_idx, -1e9, dtype=scores.dtype))
     return scores
 
-
 @torch.no_grad()
 def evaluate_attention_only_no_rng(model, dataset, device, batch_size, max_len,
                                    ks=(10, 50), collect_gate_stats=False):
-    """behavior-only 단독 랭킹(u_star 기준)을 계산하되, RNG를 전혀 소비하지 않는다(위
-    _build_batch_no_neg 참조) -- 학습 중 매 epoch 호출해도 batch 순서/negative 샘플링 궤적에
-    영향을 주지 않는다.
-
-    u_star는 forward_user_vector()가 history_ablation 분기(h_n_only/none/u_act_only)에
-    따라 이미 model-specific하게 계산하고 normalize_u_star=True(기본값)로 정규화까지 마친
-    값이므로, history_ablation="u_act_only"에서는 정확히 기존 normalize(diag['u_act'])와
-    동일하고(수치적으로 동등, 이 함수의 예전 구현과 bit-for-bit 동일한 랭킹을 낸다), "h_n_only"/
-    "none"에서는 각각 h_n/gate 기반 behavior score로 자동 일반화된다 -- 모델별 분기 없이
-    이 한 줄로 M2/M3/M4/M5 전체를 커버한다.
-
-    collect_gate_stats=True (M3/history_ablation="none" 전용): model.W_f(gate linear layer)에
-    forward hook을 걸어 이미 진행 중인 이 forward pass에서 g_u(=sigmoid(W_f(...)))를 추가 forward
-    없이 그대로 캡처하고, epoch 전체 배치에 대한 gate 값의 mean/std/min/max를 반환한다."""
     was_training = model.training
     model.eval()
     n = len(dataset)
@@ -188,7 +107,7 @@ def evaluate_attention_only_no_rng(model, dataset, device, batch_size, max_len,
     captured = {}
     hook_handle = None
     if collect_gate_stats:
-        def _hook(_module, _inp, out):    # forward hook의 고정 시그니처 (앞 두 개는 안 쓴다)
+        def _hook(_module, _inp, out):
             captured["gate_logit"] = out.detach()
         hook_handle = model.W_f.register_forward_hook(_hook)
     for start in range(0, n, batch_size):
@@ -218,16 +137,12 @@ def evaluate_attention_only_no_rng(model, dataset, device, batch_size, max_len,
                       "min": float(allg.min()), "max": float(allg.max())}
     return metrics, gate_stats
 
-
 def batch_digest(history, pos, neg):
-    """배치 구성(uid 대신 target/neg/history를 사용 -- uid는 별도로 넘기지 않으므로) 해시.
-    첫 10배치 비교 검증에서 "동일 데이터가 동일 순서로 들어왔는가"를 확인하는 용도."""
     h = hashlib.sha256()
     h.update(history.detach().cpu().numpy().tobytes())
     h.update(pos.detach().cpu().numpy().tobytes())
     h.update(neg.detach().cpu().numpy().tobytes())
     return h.hexdigest()
-
 
 def train_one_epoch(model, loader, optimizer, device, gamma, epoch, assert_state, history_ablation="u_act_only",
                     skip_nonfinite_step=False):
@@ -244,8 +159,6 @@ def train_one_epoch(model, loader, optimizer, device, gamma, epoch, assert_state
         L_joint, L_act, extra = joint_and_act_losses(model, history, delta_t, query_emb, pos, neg)
 
         if epoch == 1 and batch_idx == 0 and not assert_state["done"]:
-            # 항등식 u_star == normalize(u_act)는 history_ablation="u_act_only"에서만 성립
-            # (h_n_only/none에서는 u_star가 h_n/gate 기반이라 이 assert 자체가 성립하지 않음).
             if history_ablation == "u_act_only":
                 inline_assert_act_raw_matches_u_star(extra["u_star"], extra["e_all"], extra["diag"], pos, neg)
             assert_state["done"] = True
@@ -264,20 +177,15 @@ def train_one_epoch(model, loader, optimizer, device, gamma, epoch, assert_state
         total_loss += float(loss.item())
         n_batches += 1
     if n_skipped:
-        print(f"[skip] 비유한 grad norm 으로 건너뛴 step: {n_skipped}")
+        print(f"[skip] steps skipped for a non-finite grad norm: {n_skipped}")
     return total_loss / max(n_batches, 1)
-
 
 def update_topk(topk_list, epoch, score, k=3):
     topk_list.append((score, epoch))
     topk_list.sort(key=lambda x: -x[0])
     return topk_list[:k]
 
-
 def save_full_state(epoch, path, model, optimizer, best_joint, bad_count, joint_top3, attnonly_top3, log):
-    """model/optimizer/RNG(python·numpy·torch·cuda)/early-stop counters/log를 전부 저장한다
-    -- 이 파일만으로 학습을 정확히 이어서 재개할 수 있다 (save_ckpt()의 last.pt/epoch{N}.pt는
-    평가·공유용 경량 체크포인트로 그대로 유지, resume에는 이 파일만 사용)."""
     torch.save({
         "epoch": epoch,
         "model_state_dict": model.state_dict(),
@@ -293,50 +201,40 @@ def save_full_state(epoch, path, model, optimizer, best_joint, bad_count, joint_
         "rng_torch_cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
     }, path)
 
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--condition", type=str, required=True, choices=["T0", "T1", "M2", "M3", "M6"])
     ap.add_argument("--history_ablation", type=str, default="u_act_only",
                      choices=["h_n_only", "none", "u_act_only"],
-                     help="M2=h_n_only, M3/M6=none(learned gate), T0/T1(M4/M5)=u_act_only(기본값).")
+                     help="h_n_only | none (learned gate) | u_act_only (default).")
     ap.add_argument("--gamma", type=float, default=0.0)
     ap.add_argument("--seed", type=int, default=2026)
-    # ★ 예전에는 "amazon_books_queryA_card_22k/processed"가 하드코딩돼 있어서 cwd가 final/이
-    # 아니면 조용히 못 찾았다. 이제 --dataset에서 SCOPE 표준 경로를 유도한다.
     ap.add_argument("--dataset", type=str, required=True,
-                    help="데이터셋 키 (books / video_games / beauty). "
-                         "--processed_dir/--embed_dir의 기본값을 이 값에서 유도한다.")
+                    help="dataset key (books / video_games / beauty); the defaults of --processed_dir "
+                         "and --embed_dir are derived from it.")
     ap.add_argument("--processed_dir", type=str, default=None,
-                    help="미지정 시 data/preprocessed/{dataset}/processed")
+                    help="defaults to data/preprocessed/{dataset}/processed")
     ap.add_argument("--embed_dir", type=str, default=None,
-                    help="미지정 시 data/preprocessed/{dataset}/embeddings")
+                    help="defaults to data/preprocessed/{dataset}/embeddings")
     ap.add_argument("--out_dir", type=str, required=True)
-    # 학습 예산은 전 데이터셋 공통 200 epochs / patience 20으로 통일한다.
-    # (예전 기본값은 100/10이라 드라이버 스크립트가 매번 --epochs 200 --patience 20을
-    #  넘겨야 했고, 안 넘기면 조용히 다른 예산으로 학습됐다.)
     ap.add_argument("--epochs", type=int, default=A5_ARGS["epochs"])
     ap.add_argument("--patience", type=int, default=A5_ARGS["patience"])
-    # 배치 크기를 실행 인자로 연다 -- baseline(MAPS)이 batch 72를 쓰므로 같은 배치에서
-    # 비교하려면 필요하다. 생략하면 A5_ARGS 기본값(128)이라 기존 실행과 완전히 동일하다.
     ap.add_argument("--batch_size", type=int, default=A5_ARGS["batch_size"])
     ap.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--verify_only_batches", type=int, default=0,
-                     help="0이면 정식 학습. >0이면 그 개수만큼 배치만 돌리고 digest/loss를 저장 후 종료"
-                          "(전체 재학습 전 원본과의 첫 N배치 일치 검증용).")
+                     help="0 trains normally; a positive value runs only that many batches, saves a "
+                          "digest and the loss, and exits (a quick equivalence check).")
     ap.add_argument("--verify_out", type=str, default=None)
     ap.add_argument("--resume_from", type=str, default=None,
-                     help="full_state_last.pt 경로. 지정 시 model/optimizer/RNG/early-stop 상태를 "
-                          "전부 복원하고 epoch-0 sanity eval을 건너뛴 채 마지막 완료 epoch+1부터 이어서 "
-                          "학습한다 (save_ckpt()가 만드는 last.pt/epoch{N}.pt로는 resume 불가 -- "
-                          "반드시 save_full_state()가 만든 파일을 넘길 것).")
+                     help="path to full_state_last.pt: restores model, optimizer, RNG and early-stop "
+                          "state and continues from the epoch after the last completed one. The "
+                          "last.pt / epoch{N}.pt files cannot be resumed from.")
     ap.add_argument("--skip_nonfinite_step", action="store_true",
-                    help="grad norm 이 inf/nan 인 step 을 건너뛴다. 기본 off 는 기존 동작 유지.")
+                    help="skip steps whose grad norm is inf or nan (off by default).")
     ap.add_argument("--sdpa_math", action="store_true",
-                    help="scaled_dot_product_attention 을 math 커널로 강제한다. nn.MultiheadAttention 은 "
-                         "need_weights=False 일 때 mem-efficient 융합 커널로 디스패치되는데, 이 커널의 "
-                         "backward 가 패딩이 많은 마스크에서 폭발적인 그래디언트를 내어 NaN 을 유발한다 "
-                         "(math 대비 grad 88.14 vs 0.028 실측). 기본 off 는 기존 동작 유지.")
+                    help="force the math kernel for scaled_dot_product_attention. The fused "
+                         "mem-efficient kernel can produce exploding gradients on heavily padded "
+                         "masks, which leads to NaNs (off by default).")
     args = ap.parse_args()
 
     args.processed_dir = args.processed_dir or default_processed_dir(args.dataset)
@@ -349,20 +247,17 @@ def main():
         torch.backends.cuda.enable_flash_sdp(False)
         torch.backends.cuda.enable_mem_efficient_sdp(False)
         torch.backends.cuda.enable_math_sdp(True)
-        print("[SDPA] math 커널 강제 (flash/mem-efficient 비활성)")
+        print("[SDPA] math kernel forced (flash / mem-efficient disabled)")
 
     NO_AUX_CONDITIONS = {"T0", "M2", "M3"}
     if args.condition in NO_AUX_CONDITIONS:
-        assert args.gamma == 0.0, f"{args.condition}은 gamma=0(L_joint만)이어야 함 (Auxiliary BPR 없음)"
+        assert args.gamma == 0.0, f"{args.condition} requires gamma=0 (L_joint only, no auxiliary BPR)"
 
-    # M6 = A4/Original Full(gated) 구조 + Attention-specific auxiliary BPR. M3(gamma=0)이 그대로
-    # 통제군이 되도록, 구조 관련 인자는 M3와 동일해야 하고 gamma만 >0이어야 한다. gamma=0으로
-    # 잘못 넘기면 M3 재학습이 되어버리므로(중복 실험) 명시적으로 막는다.
     if args.condition == "M6":
-        assert args.gamma > 0.0, "M6은 gamma>0(Auxiliary BPR)이어야 함 -- gamma=0은 M3와 동일 조건"
+        assert args.gamma > 0.0, "this condition requires gamma>0 (auxiliary BPR)"
         assert args.history_ablation == "none", (
-            f"M6은 A4/Original Full 구조(learned gate)를 유지해야 하므로 history_ablation='none' "
-            f"필수 (받은 값: {args.history_ablation!r})")
+            f"this condition keeps the learned gate, so history_ablation must be 'none' "
+            f"(received {args.history_ablation!r})")
     device = torch.device(args.device)
 
     set_seed(args.seed)
@@ -379,21 +274,15 @@ def main():
 
     model = build_model(item_embs, device, history_ablation=args.history_ablation)
 
-    # map_location="cpu": RNG state 텐서(get_rng_state/get_rng_state_all)는 반드시 CPU ByteTensor여야
-    # set_rng_state()가 받아들인다 -- map_location=device로 로드하면 이 텐서까지 GPU로 옮겨져
-    # "RNG state must be a torch.ByteTensor" 에러가 난다. optimizer.load_state_dict()는 각 state
-    # 텐서를 해당 파라미터의 device로 자동 캐스팅하므로 optimizer state는 cpu 로드 후에도 안전하다.
     resume_state = (torch.load(args.resume_from, map_location="cpu", weights_only=False)
-                    if args.resume_from else None)   # torch>=2.6: weights_only 기본 True 이면
-                                                     # full_state 의 numpy RNG 상태를 못 읽는다
+                    if args.resume_from else None)
 
     if resume_state is not None:
-        assert args.verify_only_batches == 0, "--resume_from과 --verify_only_batches는 함께 쓸 수 없음"
+        assert args.verify_only_batches == 0, "--resume_from cannot be combined with --verify_only_batches"
         model.load_state_dict(resume_state["model_state_dict"])
         print(f"[Resume] loaded model/optimizer/RNG from {args.resume_from} "
               f"(last completed epoch={resume_state['epoch']})")
     else:
-        # ---- 원본과 동일: epoch-0 sanity eval (RNG parity 핵심 -- train_loader 생성 전에 위치) ----
         q_only_valid = official_evaluate(model, valid_data, device, A5_ARGS["eval_batch_size"], mode="query_only")
         print("[Sanity: epoch-0 query-only mode]", q_only_valid)
 
@@ -472,12 +361,7 @@ def main():
                                      skip_nonfinite_step=args.skip_nonfinite_step,
                                       history_ablation=args.history_ablation)
 
-        # ---- 원본과 동일: evaluate(mode="full") 단 1회만 (attention-only/ruin-rescue/gradient는
-        # offline_diagnostics_v2.py로 이동 -- 학습 중 추가 valid_data 순회로 RNG 궤적이 흔들리지
-        # 않게 한다) ----
         valid_result = official_evaluate(model, valid_data, device, A5_ARGS["eval_batch_size"], mode="full")
-        # RNG-free (dataset.__getitem__/sample_negative 미사용) -- T0/T1 batch 순서·negative
-        # 샘플링 궤적에 전혀 영향을 주지 않는다 (모듈 docstring 참조).
         attn_result, gate_stats = evaluate_attention_only_no_rng(
             model, valid_data, device, A5_ARGS["eval_batch_size"], A5_ARGS["max_len"],
             collect_gate_stats=(args.history_ablation == "none"))
@@ -537,7 +421,6 @@ def main():
     }
     save_json(manifest, out_dir / "checkpoint_manifest.json")
     print(f"[Done] {out_dir} manifest={manifest}")
-
 
 if __name__ == "__main__":
     main()

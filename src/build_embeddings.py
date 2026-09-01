@@ -1,28 +1,4 @@
 # -*- coding: utf-8 -*-
-"""
-[embed] prepare_dataset.py 산출물 + semantic_card.py 카드 -> 동결 텍스트 인코더 임베딩.
-
-산출(--out_dir):
-  item_embs.npy, item_texts.json, embedding_meta.json,
-  {train,valid,test}_instances.jsonl, {train,valid,test}_query_embs.npy
-
-[도메인 하드코딩 제거]
-예전 이 스크립트는 아이템 텍스트 앞머리(instruction)와 빈 아이템 폴백 문구에 "book"을
-하드코딩하고 있었다("Represent this book ..." / "general book recommendation") — Books를
-인코딩할 때만 우연히 맞는 문구라, 같은 스크립트를 Video_Games/Beauty에 쓰면 조용히 잘못된
-instruction으로 인코딩됐다(구 HALO의 final/build_halo_lite_embeddings.py에서 발견된 것과 동일 버그).
-이제 문구는 prompts/item_instruction_{domain}.txt에서 읽고, 도메인은 --domain 또는
---dataset에서 유도한다. 3개 instruction 파일 모두 동봉된 임베딩을 만든 문자열과
-byte-identical임을 실측 확인했으므로 재실행해도 같은 텍스트가 인코딩된다.
-
-[아이템 한 개가 실제로 인코딩되는 문자열]
-  "passage: " + instruction + "\n\n" + (카드 본문  또는  리뷰 풀 조각들)
-  · 카드가 있으면 **리뷰 풀 텍스트를 덮어쓴다**(카드 우선, build_item_texts 참조).
-  · 카드도 리뷰도 없는 아이템만 empty_item_text가 되는데, 이 경로에만 instruction이 붙지 않는다.
-  · index 0은 "padding item"이지만 인코딩 직후 item_embs[0] = 0으로 덮이므로 값 자체는 무의미하다.
-  · "passage: "/"query: "는 E5 규약이라 도메인이 아니라 **모델**에 종속된다 — --model_name을
-    prefix를 쓰지 않는 모델로 바꾸면 이 접두사가 그대로 붙는다(현재 검사하지 않음).
-"""
 
 import argparse
 import json
@@ -39,10 +15,7 @@ from config import (PROMPT_DIR, cards_path, domain_of,
                     embed_dir as default_embed_dir, processed_dir as default_processed_dir)
 from utils import load_jsonl
 
-
 def load_item_instruction(domain: str) -> str:
-    """아이템 텍스트 앞에 붙일 instruction을 prompts/item_instruction_{domain}.txt에서 읽는다.
-    review2query.py/semantic_card.py의 프롬프트 파일 관례와 동일 — 없으면 즉시 에러."""
     slug = domain.replace(" ", "_")
     path = os.path.join(PROMPT_DIR, f"item_instruction_{slug}.txt")
     if not os.path.exists(path):
@@ -52,17 +25,15 @@ def load_item_instruction(domain: str) -> str:
             if f.startswith("item_instruction_") and f.endswith(".txt")
         )
         raise FileNotFoundError(
-            f"[embed] prompts/item_instruction_{slug}.txt 없음 (--domain '{domain}'). "
-            f"사용 가능한 도메인: {available} — 새 도메인이면 그 파일을 먼저 만드세요.")
+            f"[embed] prompts/item_instruction_{slug}.txt not found (--domain '{domain}'). "
+            f"available domains: {available} — create that file first for a new domain.")
     with open(path, "r", encoding="utf-8") as f:
         return f.read().strip()
-
 
 def safe_text(x):
     if x is None:
         return ""
     return str(x).strip()
-
 
 def as_list(x):
     if x is None:
@@ -80,10 +51,7 @@ def as_list(x):
         return [x] if x.strip() else []
     return [x]
 
-
 def review_piece(title: str, text: str, max_chars: int):
-    """리뷰 한 건의 텍스트 조각. 제목·본문이 둘 다 비면 None (호출부에서 건너뛴다).
-    aggregated / row-level 두 분기에 같은 코드가 복붙돼 있던 것을 합친 것으로, 조립 규칙은 동일하다."""
     if not title and not text:
         return None
     piece = ""
@@ -92,7 +60,6 @@ def review_piece(title: str, text: str, max_chars: int):
     if text:
         piece += f"Review text: {text[:max_chars]}"
     return piece.strip()
-
 
 def load_card_texts(card_path, item_map):
     asin_to_iid = dict(zip(item_map["item_id"].to_list(), item_map["iid"].to_list()))
@@ -104,7 +71,6 @@ def load_card_texts(card_path, item_map):
             card_texts[iid] = safe_text(obj["card"])
 
     return card_texts
-
 
 def build_item_texts(pool_path, item_map_path, instruction, empty_item_text,
                      max_reviews_per_item=5, max_chars_per_review=500, card_path=None):
@@ -155,7 +121,7 @@ def build_item_texts(pool_path, item_map_path, instruction, empty_item_text,
                 break
 
         if text_col is None:
-            raise ValueError("review_text/text 또는 review_texts 컬럼이 필요합니다.")
+            raise ValueError("a review_text / text or review_texts column is required.")
 
         item_to_reviews = defaultdict(list)
 
@@ -188,25 +154,21 @@ def build_item_texts(pool_path, item_map_path, instruction, empty_item_text,
         n_card = 0
         for iid, card_text in card_texts.items():
             if 1 <= iid <= num_items and card_text:
-                # ★ 카드가 있으면 위에서 만든 리뷰 풀 텍스트를 **덮어쓴다**(카드 우선).
-                #   리뷰 풀은 카드가 없는 아이템의 폴백으로만 남는다.
                 item_texts[iid] = instruction + "\n\n" + card_text
                 n_card += 1
 
         print(f"[Card coverage] {n_card:,}/{num_items:,} items got LLM card "
               f"({max(0, n_review_pool - n_card):,} fell back to review pool)")
 
-    # 카드도 리뷰도 없는 아이템. ★ 이 경로에만 instruction이 붙지 않는다(위 세 경로와 비대칭).
     for iid in range(1, num_items + 1):
         if not item_texts[iid]:
             item_texts[iid] = empty_item_text
 
-    item_texts[0] = "padding item"   # 인코딩 직후 item_embs[0] = 0으로 덮이므로 값 자체는 무의미
+    item_texts[0] = "padding item"
 
     print("[items with text]", sum(1 for x in item_texts[1:] if x != empty_item_text))
 
     return item_texts, num_items
-
 
 def encode_texts(model, texts, batch_size, prefix):
     prefixed = [prefix + t for t in texts]
@@ -218,7 +180,6 @@ def encode_texts(model, texts, batch_size, prefix):
         show_progress_bar=True,
     )
     return emb.astype(np.float32)
-
 
 def save_queries_and_embeddings(model, instance_path, out_jsonl, out_npy, batch_size):
     rows = load_jsonl(instance_path)
@@ -251,28 +212,28 @@ def save_queries_and_embeddings(model, instance_path, out_jsonl, out_npy, batch_
     print("[Saved]", out_jsonl)
     print("[Saved]", out_npy)
 
-
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", type=str, required=True,
-                         help="데이터셋 키 (books / video_games / beauty). "
-                              "--data_dir/--out_dir/--card_path/--domain을 여기서 유도한다.")
+                         help="dataset key (books / video_games / beauty); --data_dir, --out_dir, "
+                              "--card_path and --domain are derived from it.")
     parser.add_argument("--data_dir", type=str, default=None,
-                         help="미지정 시 data/preprocessed/{dataset}/processed")
+                         help="defaults to data/preprocessed/{dataset}/processed")
     parser.add_argument("--out_dir", type=str, default=None,
-                         help="미지정 시 data/preprocessed/{dataset}/embeddings")
+                         help="defaults to data/preprocessed/{dataset}/embeddings")
     parser.add_argument("--model_name", type=str, default="intfloat/e5-base-v2")
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--max_reviews_per_item", type=int, default=5)
     parser.add_argument("--max_chars_per_review", type=int, default=500)
     parser.add_argument("--card_path", type=str, default=None,
-                         help="semantic_card.py 산출물. 미지정 시 "
-                              "data/preprocessed/{dataset}/cards.jsonl (없으면 카드 없이 리뷰 풀만 사용)")
+                         help="output of semantic_card.py; defaults to "
+                              "data/preprocessed/{dataset}/cards.jsonl (without it, only the review "
+                              "pool text is encoded)")
     parser.add_argument("--no_card", action="store_true",
-                         help="카드를 쓰지 않고 리뷰 풀 텍스트만으로 인코딩 (w/o LLM-Card 절제)")
+                         help="encode the review pool text only, without cards (the w/o LLM-Card ablation)")
     parser.add_argument("--domain", type=str, default=None,
-                         help="아이템 instruction 문구의 도메인 — prompts/item_instruction_{domain}.txt를 "
-                              "읽는다. 미지정 시 --dataset에서 유도 (books->book).")
+                         help="domain of the item instruction text; reads "
+                              "prompts/item_instruction_{domain}.txt. Derived from --dataset when omitted.")
     args = parser.parse_args()
 
     domain = args.domain or domain_of(args.dataset)
@@ -284,9 +245,9 @@ def main():
         cp = cards_path(args.dataset)
         args.card_path = cp if os.path.exists(cp) else None
         if args.card_path is None:
-            print(f"[Warn] 카드 파일이 없어 리뷰 풀만 사용합니다: {cp}")
+            print(f"[warn] no card file, encoding the review pool only: {cp}")
     instruction = load_item_instruction(domain)
-    empty_item_text = f"general {domain} recommendation"  # review2query.py의 FALLBACK_TEXT와 동일 관례
+    empty_item_text = f"general {domain} recommendation"
     print(f"[Domain] {domain}\n[Instruction] {instruction}\n[Empty-item text] {empty_item_text}")
 
     data_dir = Path(args.data_dir)
@@ -314,10 +275,9 @@ def main():
         model=model,
         texts=item_texts,
         batch_size=args.batch_size,
-        prefix="passage: ",   # E5 규약. --model_name을 바꿔도 이 접두사는 따라 바뀌지 않는다
+        prefix="passage: ",
     )
 
-    # padding row는 0으로 둔다.
     item_embs[0] = 0.0
 
     np.save(out_dir / "item_embs.npy", item_embs)
@@ -355,7 +315,6 @@ def main():
         )
 
     print("[Done]")
-
 
 if __name__ == "__main__":
     main()

@@ -1,31 +1,65 @@
-# Data directory: excluded by default (large generated/raw data)
-data/*
-!data/preprocessed/
-data/preprocessed/*
-!data/preprocessed/beauty/
-!data/preprocessed/books/
-!data/preprocessed/video_games/
+# ---------------------------------------------------------------------------
+# What belongs in this repository, and what does not.
+#
+#   repository (git)   code · prompts · README · LICENSE · requirements · reported numbers
+#   Release v1.0.0     the fixed Books artifacts (queries.parquet / cards.jsonl /
+#                      split_manifest.json / leak_dropped_uids.json / processed/)
+#   not distributed    the raw corpus (a download script is provided) and regenerable
+#                      large intermediates
+# ---------------------------------------------------------------------------
 
-# Only allow LLM-generated cards per domain
-data/preprocessed/beauty/*
-!data/preprocessed/beauty/cards.jsonl
-
-data/preprocessed/video_games/*
-!data/preprocessed/video_games/cards.jsonl
-
-# books also includes queries.parquet (tracked via Git LFS)
-data/preprocessed/books/*
-!data/preprocessed/books/cards.jsonl
-!data/preprocessed/books/queries.parquet
-
-# Python
+# ---- Python ----
 __pycache__/
-*.pyc
+*.py[cod]
+*.egg-info/
 .venv/
 venv/
-*.egg-info/
+.ipynb_checkpoints/
 
-# OS / editor
+# ---- raw corpus ----
+# Amazon Reviews 2023 is public and is not redistributed here:
+#   python src/download_data.py --category Books
+data/raw/*
+!data/raw/.gitkeep
+
+# ---- fixed artifacts: published as Release v1.0.0 assets ----
+# Kept out of git for size, not by policy (queries.parquet alone exceeds GitHub's 100 MB
+# per-file limit). Fetch them with scripts/fetch_release_assets.sh.
+data/preprocessed/*/queries.parquet
+data/preprocessed/*/cards.jsonl
+data/preprocessed/*/split_manifest.json
+data/preprocessed/*/processed/
+data/preprocessed/*/leak_dropped_uids.json
+!data/preprocessed/books/leak_dropped_uids.json
+
+# ---- large, regenerable ----
+# embeddings/ is rebuilt deterministically from processed/ + cards.jsonl by stage [6].
+data/preprocessed/*/embeddings/
+data/preprocessed/*/interactions.pkl
+data/preprocessed/*/interactions_raw.pkl
+data/preprocessed/*/sample.parquet
+data/preprocessed/_cache/
+data/preprocessed/*/cards_legacy_v1.jsonl
+
+# ---- run outputs ----
+runs/
+release_assets/
+
+# results/ holds two kinds of files. The pipeline statistics written by stages [2] and [4]
+# are regenerable and stay out; the reported numbers (paper_results.json and the per-seed
+# files) are a few kilobytes and are tracked so a reproduction can be compared against them.
+results/*
+!results/README.md
+!results/paper_results.json
+!results/books/
+results/books/*
+!results/books/seed_*.json
+
+# ---- working archives ----
+*.zip
+
+# ---- OS / editors ----
 .DS_Store
-.vscode/
+*.swp
 .idea/
+.vscode/

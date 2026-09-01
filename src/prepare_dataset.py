@@ -1,41 +1,4 @@
 # -*- coding: utf-8 -*-
-"""
-[bridge] src/ 파이프라인 산출물(review2query.py의 쿼리채움 parquet + preprocessing.py의
-split_manifest.json) -> build_embeddings.py가 바로 읽는 표준 스키마로 변환.
-
-구 HALO의 final/prepare_from_existing_query_parquet.py에서 가져온 것 — 변환/split/leakage 로직은
-무수정이다.
-SCOPE 정리판에서 바뀐 것은 경로 기본값뿐이다: --dataset 하나만 주면 --input/--manifest/--out_dir이
-data/preprocessed/{dataset}/ 아래의 표준 파일명으로 유도된다(예전에는 세 경로를 매번 손으로
-맞춰야 했고, 그 과정에서 manifest를 빠뜨리면 split이 어긋났다).
-
-입력:
-  --input     review2query.py --fixed_input ... --out <이 경로>로 만든, query 컬럼이 채워진
-              parquet (user_id, parent_asin, timestamp, query, 선택적 title/text/is_c4_user).
-              is_c4_user는 구버전 Books 산출물에만 실제 값이 들어있는 유산 컬럼이다
-              (동봉 processed_Books_sample22k_queryA.parquet에 True 4,261건). 그 값을 잃지
-              않으려고 읽기 경로만 남겨두었고, 이 컬럼을 새로 만드는 코드는 없다 —
-              컬럼이 없는 입력에는 아래에서 False로 채운다.
-  --manifest  preprocessing.py가 만든 split_manifest.json — split(valid/test)의
-              단일 진실 공급원. 이 스크립트는 split을 독립적으로 재계산하지 않고 이 manifest의
-              (user_id, item_id, timestamp) 키에만 의존한다(add_split_and_ids).
-
-출력(--out_dir/processed/ 아래):
-  train.parquet, valid.parquet, test.parquet, user_map.parquet, item_map.parquet,
-  train_sequences.jsonl, {train,valid,test}_query_instances.jsonl,
-  item_card_review_pool_train_only.parquet  <- build_embeddings.py --data_dir가 이 processed/를
-  가리키면 item_map.parquet(asin<->iid)과 이 리뷰 풀을 바로 읽는다. LLM 시맨틱 카드
-  (semantic_card.py가 만든 cards.jsonl)는 이 스크립트가 만들지 않고
-  build_embeddings.py --card_path로 별도 결합된다(item_map.parquet의 asin<->iid로 매핑) —
-  구 HALO의 final/build_halo_lite_embeddings.py가 쓰던 것과 동일한 연결 방식.
-
-★ 이 스크립트는 k-core를 한 번 더 돌린다 (--k_core 5, 기본 켜짐).
-  preprocessing.py[2]가 이미 in-sample (5,5)-core를 맞춰놨는데도 여기서 또 도는 이유는 그 사이에
-  normalize_columns()가 **query가 빈 행을 버리기** 때문이다 — 그만큼 밀도가 떨어져 core가 깨질 수
-  있다. 다만 그 결과로 manifest의 valid/test 타깃 행까지 떨어져 나가면 add_split_and_ids()가
-  [split][WARN]을 찍고, 최종 인스턴스 수가 manifest보다 줄어든다.
-  끄려면 --skip_kcore. 로직이므로 기본값은 그대로 둔다.
-"""
 
 import argparse
 import json
@@ -46,26 +9,19 @@ import numpy as np
 import polars as pl
 from tqdm import tqdm
 
-from config import (dataset_root, manifest_path as default_manifest_path,
-                    queries_path)
-
+from config import (canonical_n, canonical_eval_id, canonical_sha256, dataset_root,
+                    leak_json_path, manifest_path as default_manifest_path, queries_path)
 
 def safe_text(x):
     if x is None:
         return ""
     return str(x).replace("\n", " ").replace("\r", " ").strip()
 
-
 def print_shape(tag: str, df: pl.DataFrame) -> None:
     print(f"[{tag}] rows={df.height:,}, users={df['user_id'].n_unique():,}, "
           f"items={df['item_id'].n_unique():,}")
 
-
 def iterative_kcore(df: pl.DataFrame, k: int = 5) -> pl.DataFrame:
-    """
-    user/item iterative k-core.
-    user와 item이 모두 k개 이상 interaction을 가질 때까지 반복.
-    """
     prev_n = -1
     step = 0
 
@@ -96,7 +52,6 @@ def iterative_kcore(df: pl.DataFrame, k: int = 5) -> pl.DataFrame:
 
     return df
 
-
 def sample_users(df: pl.DataFrame, n_users: int, seed: int = 42) -> pl.DataFrame:
     users = df.select("user_id").unique().to_series().to_list()
 
@@ -118,12 +73,7 @@ def sample_users(df: pl.DataFrame, n_users: int, seed: int = 42) -> pl.DataFrame
 
     return sampled_df
 
-
 def normalize_columns(df: pl.DataFrame) -> pl.DataFrame:
-    """
-    review2query.py 산출물(queries.parquet)의 컬럼을 HALO-SR용 이름으로 정리한다.
-    parent_asin -> item_id / title -> review_title / text -> review_text
-    """
     rename_map = {src: dst for src, dst in (("parent_asin", "item_id"),
                                             ("title", "review_title"),
                                             ("text", "review_text"))
@@ -135,12 +85,10 @@ def normalize_columns(df: pl.DataFrame) -> pl.DataFrame:
     if missing:
         raise ValueError(f"Missing required columns: {missing}")
 
-    # optional columns 보강 (is_c4_user는 구버전 Books 산출물에만 실제 값이 있는 유산 컬럼)
     for col, default in (("review_title", ""), ("review_text", ""), ("is_c4_user", False)):
         if col not in df.columns:
             df = df.with_columns(pl.lit(default).alias(col))
 
-    # 타입 정리
     df = df.with_columns(
         [
             pl.col("user_id").cast(pl.Utf8),
@@ -152,7 +100,6 @@ def normalize_columns(df: pl.DataFrame) -> pl.DataFrame:
         ]
     )
 
-    # query 비어 있는 row 제거
     df = df.filter(
         pl.col("query").is_not_null()
         & (pl.col("query").str.strip_chars().str.len_chars() > 0)
@@ -160,35 +107,36 @@ def normalize_columns(df: pl.DataFrame) -> pl.DataFrame:
 
     return df
 
-
-def deduplicate_user_item(df: pl.DataFrame) -> pl.DataFrame:
-    """
-    같은 유저가 같은 item에 여러 번 등장하면 가장 이른 timestamp만 유지.
-    """
+def deduplicate_user_item(df: pl.DataFrame, protected_keys=None) -> pl.DataFrame:
     before = df.height
 
+    if protected_keys:
+        keys = pl.DataFrame(
+            {"user_id": [k[0] for k in protected_keys],
+             "item_id": [k[1] for k in protected_keys],
+             "timestamp": [k[2] for k in protected_keys]},
+            schema={"user_id": pl.Utf8, "item_id": pl.Utf8, "timestamp": pl.Int64},
+        ).with_columns(pl.lit(0, dtype=pl.Int8).alias("_keep_first"))
+        df = (df.join(keys, on=["user_id", "item_id", "timestamp"], how="left")
+                .with_columns(pl.col("_keep_first").fill_null(1)))
+    else:
+        df = df.with_columns(pl.lit(1, dtype=pl.Int8).alias("_keep_first"))
+
+    protected_before = int((df["_keep_first"] == 0).sum())
     df = (
-        df.sort(["user_id", "item_id", "timestamp"])
+        df.sort(["user_id", "item_id", "_keep_first", "timestamp"])
         .unique(subset=["user_id", "item_id"], keep="first", maintain_order=True)
     )
+    protected_after = int((df["_keep_first"] == 0).sum())
+    df = df.drop("_keep_first")
 
-    after = df.height
-    print(f"[dedup] rows: {before:,} -> {after:,}")
-
+    print(f"[dedup] rows: {before:,} -> {df.height:,}")
+    if protected_keys:
+        print(f"[dedup] manifest targets protected: {protected_before:,} -> {protected_after:,} "
+              f"({protected_before - protected_after:,} had more than one target per (user, item))")
     return df
 
-
 def load_manifest_split_keys(manifest_path: str):
-    """
-    preprocessing.py가 만든 immutable manifest에서 valid/test 타깃
-    (user_id, item_id, timestamp) 키 집합을 읽는다.
-
-    이 manifest가 카테고리의 split을 정의하는 단일 진실 공급원이다 — 카드 생성
-    (semantic_card.py)도 같은 manifest를 읽으므로, 여기서 split을 독립적으로
-    재계산하면(과거에 leave-last-two-out을 다시 계산했던 방식) 두 스크립트의 split이
-    어긋날 수 있다. 실제로 22k Books에서 이 어긋남 때문에 788건의 valid/test 타깃 리뷰가
-    카드 제외 대상에서 빠졌고, 그중 112건이 실제로 카드에 leak됐다.
-    """
     with open(manifest_path, "r", encoding="utf-8") as f:
         manifest = json.load(f)
 
@@ -196,24 +144,16 @@ def load_manifest_split_keys(manifest_path: str):
     test_keys = {(r["user_id"], r["item_id"], r["timestamp"]) for r in manifest["test"]}
     return valid_keys, test_keys
 
-
 def add_split_and_ids(df: pl.DataFrame, valid_keys, test_keys):
-    """
-    uid/iid mapping 생성 + split 부여.
-
-    split은 오직 manifest(load_manifest_split_keys)에서만 가져온다 — 이 함수는 더 이상
-    leave-last-out을 독립적으로 재계산하지 않는다. valid_keys/test_keys는 필수 인자다.
-    """
     if not valid_keys or not test_keys:
         raise ValueError(
-            "add_split_and_ids: valid_keys/test_keys가 비어 있습니다. "
-            "preprocessing.py로 만든 manifest를 --manifest로 지정했는지 확인하세요. "
-            "split을 자체 재계산하는 경로는 (leakage 재발 방지를 위해) 제거됐습니다."
+            "add_split_and_ids: valid_keys / test_keys are empty. Pass the manifest written by "
+            "preprocessing.py with --manifest; recomputing the split here is not supported."
         )
 
     df = df.sort(["user_id", "timestamp", "item_id"])
 
-    print(f"[split] manifest split 사용: valid_keys={len(valid_keys):,} test_keys={len(test_keys):,}")
+    print(f"[split] using the manifest split: valid_keys={len(valid_keys):,} test_keys={len(test_keys):,}")
 
     key_df = pl.concat(
         [
@@ -241,10 +181,10 @@ def add_split_and_ids(df: pl.DataFrame, valid_keys, test_keys):
     n_test = df.filter(pl.col("split") == "test").height
     if n_valid != len(valid_keys) or n_test != len(test_keys):
         print(
-            f"[split][WARN] manifest의 valid/test 키 중 일부가 이 df에 없습니다 "
+            f"[split][WARN] some manifest valid/test keys are absent from this dataframe "
             f"(manifest valid={len(valid_keys):,} -> matched {n_valid:,}, "
             f"manifest test={len(test_keys):,} -> matched {n_test:,}). "
-            f"이 스크립트 자체의 k-core/dedup/sampling이 manifest와 다른 행 집합을 만들었을 수 있습니다."
+            f"k-core / dedup / sampling in this script may have produced a different row set than the manifest."
         )
 
     df = df.with_columns(
@@ -273,12 +213,7 @@ def add_split_and_ids(df: pl.DataFrame, valid_keys, test_keys):
 
     return df, users, items
 
-
 def write_train_sequences(df: pl.DataFrame, output_path: Path, max_seq_len: int):
-    """
-    SASRec 기본 학습용 sequence.
-    train interaction만 사용.
-    """
     train = df.filter(pl.col("split") == "train")
 
     train_seq = (
@@ -296,31 +231,12 @@ def write_train_sequences(df: pl.DataFrame, output_path: Path, max_seq_len: int)
     train_seq.write_ndjson(output_path)
     print(f"[train_sequences] saved to {output_path}")
 
-
 def write_query_instances(
     df: pl.DataFrame,
     split_name: str,
     output_path: Path,
     max_seq_len: int,
 ):
-    """
-    query-aware 학습/평가용 instance 생성.
-
-    train:
-      각 train target마다 이전 train history를 붙임.
-      예: [10] + query_for_25 -> 25
-
-    valid:
-      valid target 이전 history를 붙임.
-
-    test:
-      test target 이전 history를 붙임.
-      이때 history에는 valid item까지 포함됨.
-
-    history는 split으로 거르지 않고 그 유저의 **이전 행 전부**(g.iloc[:idx])에서 가져온다.
-    valid/test 타깃이 유저 시퀀스의 마지막 두 개라, train 타깃의 이전 행은 자동으로 전부 train이
-    되고 test의 이전 행에는 valid가 포함된다 — 위 세 줄이 그 결과다.
-    """
     use_cols = [
         "uid",
         "iid",
@@ -352,7 +268,6 @@ def write_query_instances(
 
                 hist = g.iloc[:idx].tail(max_seq_len)
 
-                # history가 없는 첫 interaction은 next-item/query-aware 학습에 부적합
                 if len(hist) == 0:
                     continue
 
@@ -375,13 +290,7 @@ def write_query_instances(
 
     print(f"[query_instances] {split_name}: {n_written:,} rows -> {output_path}")
 
-
 def write_item_card_pool(df: pl.DataFrame, output_path: Path, max_reviews_per_item: int = 5):
-    """
-    item semantic card 생성용 review pool.
-    반드시 train review만 사용한다.
-    valid/test review는 leakage 방지를 위해 제외.
-    """
     train = df.filter(pl.col("split") == "train")
 
     pool = (
@@ -399,14 +308,7 @@ def write_item_card_pool(df: pl.DataFrame, output_path: Path, max_reviews_per_it
     pool.write_parquet(output_path)
     print(f"[item_card_pool] saved to {output_path}")
 
-
 def verify_final_split_consistency(processed_dir: Path, valid_keys: set, test_keys: set):
-    """
-    최종 valid/test query instance 파일을 다시 읽어, manifest의 valid/test 키와
-    정확히 일치하는지 재검사한다 (write_query_instances가 "history 없는 첫 interaction"을
-    거르므로 최종 건수는 manifest보다 적을 수 있지만, 그 차이는 반드시 이 필터 때문이어야
-    하고, 다른 split으로 새거나 하면 안 된다).
-    """
     def read_keys(path):
         keys = set()
         with open(path, encoding="utf-8") as f:
@@ -426,49 +328,96 @@ def verify_final_split_consistency(processed_dir: Path, valid_keys: set, test_ke
     ok = True
     if valid_not_in_manifest:
         ok = False
-        print(f"[verify][FAIL] valid_query_instances.jsonl에 manifest에 없는 키 {len(valid_not_in_manifest):,}건")
+        print(f"[verify][FAIL] {len(valid_not_in_manifest):,} keys in valid_query_instances.jsonl are not in the manifest")
     if test_not_in_manifest:
         ok = False
-        print(f"[verify][FAIL] test_query_instances.jsonl에 manifest에 없는 키 {len(test_not_in_manifest):,}건")
+        print(f"[verify][FAIL] {len(test_not_in_manifest):,} keys in test_query_instances.jsonl are not in the manifest")
     if valid_in_test_keys:
         ok = False
-        print(f"[verify][FAIL] valid instance인데 manifest test 키와 겹치는 것 {len(valid_in_test_keys):,}건")
+        print(f"[verify][FAIL] {len(valid_in_test_keys):,} valid instances collide with manifest test keys")
     if test_in_valid_keys:
         ok = False
-        print(f"[verify][FAIL] test instance인데 manifest valid 키와 겹치는 것 {len(test_in_valid_keys):,}건")
+        print(f"[verify][FAIL] {len(test_in_valid_keys):,} test instances collide with manifest valid keys")
 
     print(f"[verify] manifest valid={len(valid_keys):,} -> final valid_query_instances={len(final_valid):,} "
-          f"(no-history 등으로 누락 가능, {len(valid_keys) - len(final_valid):,}건 차이)")
+          f"(instances without history are skipped; difference {len(valid_keys) - len(final_valid):,})")
     print(f"[verify] manifest test ={len(test_keys):,} -> final test_query_instances ={len(final_test):,} "
-          f"({len(test_keys) - len(final_test):,}건 차이)")
+          f"(difference {len(test_keys) - len(final_test):,})")
 
-    assert ok, "최종 valid/test instance split이 manifest와 어긋납니다 — 위 [FAIL] 항목을 확인하세요."
-    print("[verify] OK: 최종 valid/test instance split이 manifest와 정확히 일치(부분집합)합니다.")
+    assert ok, "the final valid/test instance split disagrees with the manifest — see the [FAIL] lines above."
+    print("[verify] OK: the final valid/test instance split is exactly a subset of the manifest.")
 
+def check_canonical_population(processed_dir: Path, dataset: str) -> dict:
+    expected_n, expected_id = canonical_n(dataset), canonical_sha256(dataset)
+    with open(processed_dir / "test_query_instances.jsonl", encoding="utf-8") as f:
+        rows = [json.loads(line) for line in f]
+
+    leak_path = leak_json_path(dataset)
+    dropped = set()
+    if os.path.exists(leak_path):
+        with open(leak_path, encoding="utf-8") as f:
+            dropped = {int(u) for u in json.load(f)["combined_dropped_uids_union_both_splits"]}
+    kept = [o for o in rows if int(o["uid"]) not in dropped]
+    obtained_n = len(kept)
+    obtained_id = canonical_eval_id(kept)
+
+    n_ok = expected_n is None or obtained_n == expected_n
+    id_ok = expected_id is None or obtained_id == expected_id
+    result = {"expected_n": expected_n, "obtained_n": obtained_n,
+              "expected_sha256": expected_id, "obtained_sha256": obtained_id,
+              "test_instances": len(rows), "leak_dropped_users": len(dropped),
+              "match": n_ok and id_ok and not (expected_n is None and expected_id is None)}
+
+    exp_str = f"{expected_n:,}" if expected_n is not None else "(not registered in config.DATASETS)"
+    print(f"[canonical] Expected canonical {dataset} evaluation population: {exp_str}")
+    print(f"[canonical] Obtained: {obtained_n:,}  "
+          f"(test instances {len(rows):,} - leak-dropped users {len(dropped):,})")
+    print(f"[canonical] sha256   expected={expected_id or '(not registered)'}")
+    print(f"[canonical]          obtained={obtained_id}")
+    if expected_n is None and expected_id is None:
+        print("[canonical] SKIP — nothing to compare against. For a new dataset, register the count and "
+              "sha256 above as canonical_n / canonical_sha256 in config.DATASETS and later runs verify themselves.")
+    elif result["match"]:
+        print("[canonical] PASS — count and content (users, targets, histories) match the reported evaluation set.")
+    elif not n_ok:
+        print(f"[canonical] FAIL — count mismatch {obtained_n:,} != {expected_n:,} ({obtained_n - expected_n:+,})")
+    else:
+        print("[canonical] FAIL — same count but different content (sha256 mismatch): the targets or "
+              "histories differ from the reported evaluation set.")
+    return result
 
 def main():
     parser = argparse.ArgumentParser()
 
     parser.add_argument("--dataset", type=str, required=True,
-                         help="데이터셋 키 (books / video_games / beauty). "
-                              "--input/--manifest/--out_dir의 기본값을 이 값에서 유도한다.")
+                         help="dataset key (books / video_games / beauty). "
+                              "the defaults of --input, --manifest and --out_dir are derived from it.")
     parser.add_argument("--input", type=str, default=None,
-                         help="review2query.py 산출물(query 컬럼이 채워진 parquet). 미지정 시 "
-                              "data/preprocessed/{dataset}/queries.parquet")
+                         help="output of review2query.py (parquet with the query column filled). "
+                              "Defaults to data/preprocessed/{dataset}/queries.parquet")
     parser.add_argument("--manifest", type=str, default=None,
-                         help="preprocessing.py가 만든 split_manifest.json 경로. "
-                              "split은 이 manifest에서만 가져오며 독립 재계산하지 않는다. "
-                              "미지정 시 data/preprocessed/{dataset}/split_manifest.json")
+                         help="path to the split_manifest.json written by preprocessing.py. The split "
+                              "comes only from this manifest and is never recomputed. Defaults to "
+                              "data/preprocessed/{dataset}/split_manifest.json")
     parser.add_argument("--out_dir", type=str, default=None,
-                         help="processed/ 를 만들 상위 폴더. 미지정 시 data/preprocessed/{dataset}/")
-    parser.add_argument("--k_core", type=int, default=5)
+                         help="parent directory for processed/. Defaults to data/preprocessed/{dataset}/")
+    parser.add_argument("--k_core", type=int, default=0,
+                         help="0 (default) does not re-apply k-core: the manifest is the single source "
+                              "of truth for the split, and the released artifacts were built without "
+                              "re-applying it. Pass a positive value to re-densify a new dataset.")
     parser.add_argument("--sample_users", type=int, default=0)
     parser.add_argument("--max_seq_len", type=int, default=200)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max_reviews_per_item", type=int, default=5)
 
-    parser.add_argument("--skip_kcore", action="store_true")
-    parser.add_argument("--skip_dedup", action="store_true")
+    parser.add_argument("--allow_new_population", action="store_true",
+                         help="continue even when the evaluation population differs from canonical_n in "
+                              "config.DATASETS. Use it for a dataset newly built with stages [1]-[4], "
+                              "whose evaluation population is not the one behind the reported tables.")
+    parser.add_argument("--skip_kcore", action="store_true",
+                         help="same as --k_core 0 (backwards-compatible alias).")
+    parser.add_argument("--skip_dedup", action="store_true",
+                         help="keep duplicate (user, item) rows instead of reducing them to one.")
 
     args = parser.parse_args()
 
@@ -477,9 +426,9 @@ def main():
     args.out_dir = args.out_dir or dataset_root(args.dataset)
     if not os.path.exists(args.manifest):
         raise FileNotFoundError(
-            f"[prepare] manifest가 없습니다: {args.manifest}\n"
-            f"       아직 전처리를 안 돌렸다면:  python src/preprocessing.py --dataset {args.dataset}\n"
-            f"       pkl만 있고 manifest가 없다면(구버전 산출물, 재샘플링 금지):\n"
+            f"[prepare] manifest not found: {args.manifest}\n"
+            f"       if preprocessing has not run yet:  python src/preprocessing.py --dataset {args.dataset}\n"
+            f"       if only the pkl exists (older output; do not re-sample):\n"
             f"         python src/preprocessing.py --dataset {args.dataset} --from_pkl")
     print(f"[prepare] dataset={args.dataset}\n"
           f"          input   ={args.input}\n"
@@ -506,9 +455,10 @@ def main():
     print(f"items: {df['item_id'].n_unique():,}")
 
     if not args.skip_dedup:
-        df = deduplicate_user_item(df)
+        df = deduplicate_user_item(df, protected_keys=valid_keys | test_keys)
 
-    if not args.skip_kcore:
+    skip_kcore = args.skip_kcore or args.k_core <= 0
+    if not skip_kcore:
         print(f"[k-core] first {args.k_core}-core")
         df = iterative_kcore(df, k=args.k_core)
         print_shape("after first k-core", df)
@@ -517,7 +467,7 @@ def main():
         print("[sample] user-level sampling")
         df = sample_users(df, n_users=args.sample_users, seed=args.seed)
 
-        if not args.skip_kcore:
+        if not skip_kcore:
             print(f"[k-core] re-{args.k_core}-core after sampling")
             df = iterative_kcore(df, k=args.k_core)
             print_shape("after re-k-core", df)
@@ -574,8 +524,10 @@ def main():
         max_reviews_per_item=args.max_reviews_per_item,
     )
 
-    print("[verify] 최종 valid/test instance split을 manifest와 재대조합니다...")
+    print("[verify] re-checking the final valid/test instance split against the manifest ...")
     verify_final_split_consistency(processed_dir, valid_keys, test_keys)
+
+    population = check_canonical_population(processed_dir, args.dataset)
 
     preprocess_config = {
         "dataset": args.dataset,
@@ -584,9 +536,11 @@ def main():
         "item_id": "parent_asin -> item_id",
         "query_source": "existing query column in input parquet",
         "split": "manifest-joined (preprocessing.py; no independent recomputation)",
-        "k_core": None if args.skip_kcore else args.k_core,
+        "k_core": None if skip_kcore else args.k_core,
+        "dedup": not args.skip_dedup,
         "sample_users": args.sample_users,
         "max_seq_len": args.max_seq_len,
+        "canonical_population": population,
         "leakage_policy": {
             "train_sequences": "train interactions only",
             "item_card_pool": "train reviews only",
@@ -600,6 +554,19 @@ def main():
 
     print(f"[done] processed data saved to {processed_dir}")
 
+    known = population["expected_n"] is not None or population["expected_sha256"] is not None
+    if known and not population["match"] and not args.allow_new_population:
+        raise SystemExit(
+            f"[canonical][abort] the evaluation set differs from the reported one "
+            f"(count {population['obtained_n']:,} vs {population['expected_n']:,}, "
+            f"sha256 {population['obtained_sha256'][:16]}… vs "
+            f"{(population['expected_sha256'] or '')[:16]}…).\n"
+            f"  Continuing would train and evaluate on a different population, and "
+            f"test.py --leak_drop would stop for the same reason once training is done.\n"
+            f"  · Reproducing from the released artifacts: check that the inputs are the distributed "
+            f"queries.parquet / split_manifest.json.\n"
+            f"  · Building a new dataset with stages [1]-[4]: a different population is expected — "
+            f"pass --allow_new_population, and treat the numbers as this build's, not the paper's.")
 
 if __name__ == "__main__":
     main()
